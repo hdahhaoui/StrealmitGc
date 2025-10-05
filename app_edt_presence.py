@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # app_edt_presence.py
 # Lecture SEULE depuis data/ (EDT + Students en .xlsx ou .csv)
-# QR -> pointage direct, "Pointage par salle", "Administration"
-# Mode kiosque par salle via ?room=A118 (et option ?day=LUNDI)
+# A chaque "Envoyer": on met à jour data/attendance_records.csv puis on pousse ce fichier vers un dossier Google Drive.
+# QR (session_id) + Kiosque par salle (?room=A118&day=LUNDI)
 
 import io
 import os
@@ -13,10 +13,15 @@ import pandas as pd
 import streamlit as st
 import qrcode
 
+# Google Drive (service account simple)
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from google.oauth2.service_account import Credentials
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Pointage GC (Lecture seule)", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Pointage GC (Drive)", page_icon="🧭", layout="wide")
 
 JOURS = ["DIMANCHE", "LUNDI", "MARDI", "MERCREDI", "JEUDI"]
 REQ_EDT = {"session_id","level","speciality","group","day","start","end","course","teacher","room"}
@@ -37,7 +42,6 @@ def read_any(path: Path) -> pd.DataFrame | None:
     return None
 
 def load_from_data_or_fail(basename: str) -> pd.DataFrame:
-    # Priorité: .xlsx puis .csv
     xlsx = DATA_DIR / f"{basename}.xlsx"
     csv  = DATA_DIR / f"{basename}.csv"
     df = read_any(xlsx) or read_any(csv)
@@ -49,12 +53,10 @@ def load_from_data_or_fail(basename: str) -> pd.DataFrame:
 def normalize_edt(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
-    # Colonnes requises
     for c in REQ_EDT:
         if c not in df.columns: df[c] = ""
-    # MAJUSCULES pour day
     df["day"] = df["day"].astype(str).str.strip().str.upper()
-    # Normaliser heures
+
     def norm_time(x):
         s = str(x).strip().replace("h",":")
         try: return datetime.strptime(s, "%H:%M").strftime("%H:%M")
@@ -63,7 +65,7 @@ def normalize_edt(df: pd.DataFrame) -> pd.DataFrame:
             except Exception: return s
     df["start"] = df["start"].apply(norm_time)
     df["end"]   = df["end"].apply(norm_time)
-    # session_id auto si manquant
+
     need = df["session_id"].astype(str).str.strip().eq("") if "session_id" in df else True
     if need is True or need.any():
         df["session_id"] = (
@@ -92,10 +94,9 @@ def load_all():
     return edt_df, students_df
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OUTILS
+# OUTILS GÉNÉRAUX
 # ──────────────────────────────────────────────────────────────────────────────
 def get_default_day() -> str:
-    # Monday=0 ... Sunday=6 → map FR
     map_fr = {0:"LUNDI",1:"MARDI",2:"MERCREDI",3:"JEUDI",4:"VENDREDI",5:"SAMEDI",6:"DIMANCHE"}
     return map_fr.get(datetime.now().weekday(), "LUNDI")
 
@@ -122,15 +123,61 @@ def upcoming_sessions_for_day(edt: pd.DataFrame, day: str, within_minutes: int =
     for _, r in day_df.iterrows():
         try:
             sd = datetime.combine(now.date(), datetime.strptime(r["start"], "%H:%M").time())
-            ed = datetime.combine(now.date(), datetime.strptime(r["end"], "%H:%M").time())
+            _ = datetime.combine(now.date(), datetime.strptime(r["end"], "%H:%M").time())
         except Exception:
             continue
         if sd - timedelta(minutes=15) <= now <= sd + timedelta(minutes=within_minutes):
             rows.append(r)
     return pd.DataFrame(rows) if rows else day_df.sort_values(["start","room"])
 
-def save_attendance(records_df: pd.DataFrame) -> Path:
-    # ⚠️ Sur Streamlit Cloud, ce fichier est éphémère (prévoir export/Google Sheets plus tard)
+# ──────────────────────────────────────────────────────────────────────────────
+# GOOGLE DRIVE (UPLOAD SIMPLE)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_drive_client() -> GoogleDrive | None:
+    try:
+        sa = st.secrets.get("gcp_service_account", None)
+        if not sa: return None
+        creds = Credentials.from_service_account_info(dict(sa), scopes=["https://www.googleapis.com/auth/drive"])
+        gauth = GoogleAuth()
+        gauth.auth_method = "service"
+        gauth.credentials = creds
+        return GoogleDrive(gauth)
+    except Exception:
+        return None
+
+def upload_file_to_drive(local_path: Path, remote_name: str | None = None) -> tuple[bool, str]:
+    """
+    Envoie un fichier vers le dossier Drive spécifié par DRIVE_FOLDER_ID.
+    Retourne (ok, message_ou_lien).
+    """
+    folder_id = st.secrets.get("DRIVE_FOLDER_ID", "")
+    if not folder_id:
+        return (False, "DRIVE_FOLDER_ID manquant dans secrets.")
+    drive = get_drive_client()
+    if drive is None:
+        return (False, "Impossible d'initialiser le client Google Drive (secrets/permissions).")
+
+    try:
+        fn = remote_name or local_path.name
+        f = drive.CreateFile({"title": fn, "parents": [{"id": folder_id}]})
+        f.SetContentFile(str(local_path))
+        f.Upload()
+        # essayer de récupérer un lien de visualisation
+        f.FetchMetadata(fields="id, webViewLink")
+        link = f.get("webViewLink") or f.get("id")
+        return (True, str(link))
+    except Exception as e:
+        return (False, f"Erreur upload Drive: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERSISTANCE LOCALE + UPLOAD DRIVE
+# ──────────────────────────────────────────────────────────────────────────────
+def save_and_push_attendance(records_df: pd.DataFrame) -> tuple[str, str]:
+    """
+    1) Append local -> data/attendance_records.csv
+    2) Upload le fichier complet vers Drive sous un nom horodaté
+    Retourne (mode, info) : mode='drive' si upload OK, sinon 'csv'
+    """
     csv_path = DATA_DIR / "attendance_records.csv"
     if csv_path.exists():
         old = pd.read_csv(csv_path)
@@ -138,15 +185,27 @@ def save_attendance(records_df: pd.DataFrame) -> Path:
     else:
         new = records_df
     new.to_csv(csv_path, index=False)
-    return csv_path
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    remote_name = f"attendance_records_{ts}.csv"
+    ok, info = upload_file_to_drive(csv_path, remote_name=remote_name)
+    if ok:
+        return ("drive", info)
+    return ("csv", csv_path.name)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CHARGEMENT
 # ──────────────────────────────────────────────────────────────────────────────
 edt_df, students_df = load_all()
 
+with st.sidebar:
+    if st.secrets.get("DRIVE_FOLDER_ID", ""):
+        st.success("Stockage: Google Drive (upload de attendance_records.csv)")
+    else:
+        st.warning("Stockage: CSV local uniquement (configurer DRIVE_FOLDER_ID dans secrets)")
+
 # ──────────────────────────────────────────────────────────────────────────────
-# ROUTAGE QUERY PARAMS (QR direct, kiosque par salle)
+# ROUTAGE (QR direct, kiosque par salle)
 # ──────────────────────────────────────────────────────────────────────────────
 q = st.experimental_get_query_params()
 
@@ -171,11 +230,13 @@ def render_session_form(session_id: str):
     if studs.empty:
         st.warning("Aucun étudiant pour cette combinaison (level/speciality/group).")
         return
+
     studs["present"] = False
     edited = st.data_editor(studs[["student_id","name","present"]],
                             num_rows="fixed", use_container_width=True, height=420,
                             key=f"ed_s_{session_id}")
     remark = st.text_area("Remarque au département (optionnel)", key=f"rem_s_{session_id}")
+
     if st.button("✅ Envoyer le pointage", key=f"send_s_{session_id}"):
         out = edited.copy()
         out["session_id"] = session_id
@@ -184,25 +245,16 @@ def render_session_form(session_id: str):
         out["room"] = row["room"]
         out["course"] = row["course"]
         out["remark"] = remark
-        pth = save_attendance(out)
-        st.success(f"Présences enregistrées ({len(out)} lignes) → {pth.name}")
 
-# 1) Lien direct par QR
+        mode, info = save_and_push_attendance(out)
+        if mode == "drive":
+            st.success(f"Présences envoyées et fichier poussé sur Google Drive ✅\nLien: {info}")
+        else:
+            st.success(f"Présences enregistrées en CSV local → {info}")
+
+# Lien direct par QR
 if "session_id" in q:
     render_session_form(q["session_id"][0])
-    st.stop()
-
-# 2) Page administration (lecture seule + export)
-if q.get("admin", ["0"])[0] == "1":
-    st.title("🗂️ Administration — enregistrements")
-    csv_path = DATA_DIR / "attendance_records.csv"
-    if csv_path.exists():
-        df_att = pd.read_csv(csv_path)
-        st.dataframe(df_att, use_container_width=True, height=520)
-        st.download_button("⬇️ Export CSV", data=df_att.to_csv(index=False).encode("utf-8"),
-                           file_name="attendance_records_export.csv", mime="text/csv", key="adm_dl")
-    else:
-        st.info("Aucun enregistrement pour l’instant.")
     st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -242,10 +294,11 @@ with tab1:
             st.code(url, language="text")
 
 with tab2:
-    st.subheader("Pointage par **Salle**")
-    # Mode kiosque : ?room=A118 (et ?day=LUNDI optionnel)
-    fixed_room = q.get("room", [None])[0]
-    fixed_day  = q.get("day",  [None])[0]
+    st.subheader("Pointage par **Salle** (mode kiosque)")
+    qparams = st.experimental_get_query_params()
+    fixed_room = qparams.get("room", [None])[0]
+    fixed_day  = qparams.get("day",  [None])[0]
+
     d1, d2 = st.columns([1,2])
     with d1:
         day2 = fixed_day if fixed_day in JOURS else st.selectbox("Jour", JOURS,
@@ -266,11 +319,10 @@ with tab2:
 
     if sess_sel:
         session_id = sess_sel.split("|")[0].strip()
-        # Réutilise le même formulaire que QR
         render_session_form(session_id)
 
 with tab3:
-    st.subheader("Administration — enregistrements")
+    st.subheader("Administration — enregistrements (CSV local)")
     csv_path = DATA_DIR / "attendance_records.csv"
     if csv_path.exists():
         df_att = pd.read_csv(csv_path)
@@ -278,6 +330,7 @@ with tab3:
         st.download_button("⬇️ Export CSV", data=df_att.to_csv(index=False).encode("utf-8"),
                            file_name="attendance_records_export.csv", mime="text/csv", key="adm_dl2")
     else:
-        st.info("Aucun enregistrement disponible pour l’instant.")
+        st.info("Aucun enregistrement CSV local pour l’instant.")
 
-st.caption("Lecture seule depuis data/. Pour QR publics, définissez st.secrets['BASE_URL'] sur Streamlit Cloud. Mode kiosque: ajoutez ?room=A118&day=LUNDI à l’URL.")
+st.caption("A chaque envoi: mise à jour du CSV local puis upload vers le dossier Google Drive défini. QR: ?session_id=...  |  Kiosque: ?room=A118&day=LUNDI")
+
